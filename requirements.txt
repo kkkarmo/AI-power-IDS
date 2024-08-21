@@ -1,0 +1,6 @@
+psycopg2-binary==2.9.6
+requests==2.31.0
+schedule==1.2.0
+watchdog==3.0.0
+python-dotenv==1.0.0
+ratelimit==2.2.1
