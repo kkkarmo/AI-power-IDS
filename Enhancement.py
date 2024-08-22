@@ -191,9 +191,16 @@ def initialize_database():
     cursor.close()
     connection_pool.putconn(conn)
 
-def process_log_data(log_data):
+def process_log_data(combined_data_str):
+    prompt = f"""Analyze the following log entry, VirusTotal result, and Tavily search results:
+
+{combined_data_str}
+
+Provide a concise summary of the security implications and any recommended actions."""
+
     response = requests.post(
-        'http://localhost:11434/generate', json={'model': 'llama2', 'prompt': log_data}
+        'http://localhost:11434/generate',
+        json={'model': 'llama2', 'prompt': prompt}
     )
     if response.status_code == 200:
         return response.json().get('text', '')
@@ -282,17 +289,47 @@ def save_tavily_results_to_database(data):
     cursor.close()
     connection_pool.putconn(conn)
 
+def get_tavily_result(ip):
+    queries = [
+        f"Why is IP {ip} flagged as malicious or suspicious?",
+        f"What can be found about IP {ip} in terms of cybersecurity aspects?"
+    ]
+    results = []
+    for query in queries:
+        result = tavily_search(query)
+        results.append(result)
+    return results
+
 def process_logs():
-    vt_results = read_vt_results(VT_RESULT_FILE_PATH)
+    vt_results, _ = read_vt_results(VT_RESULT_FILE_PATH)
     with open(LOG_FILE_PATH, 'r') as file:
         log_entries = [json.loads(line.strip()) for line in file]
+    
     with ThreadPoolExecutor(max_workers=5) as executor:
         for log_data in log_entries:
             ip = log_data.get('src_ip')
-            vt_result = vt_results.get(ip, "No VT result")
-            combined_data = f"Log: {log_data}, VT: {vt_result}"
-            analysis_result = executor.submit(process_log_data, combined_data)
-            save_to_database(json.dumps(log_data), vt_result, analysis_result.result())
+            if ip and EveFileHandler.is_public_ip(ip):
+                vt_result = next((result for result in vt_results if result[0] == ip), None)
+                
+                if vt_result:
+                    ip, malicious, suspicious = vt_result
+                    vt_info = f"Malicious: {malicious}, Suspicious: {suspicious}"
+                    tavily_results = get_tavily_result(ip)
+                else:
+                    vt_info = "No VT result"
+                    tavily_results = []
+                
+                combined_data = {
+                    "log": log_data,
+                    "vt_result": vt_info,
+                    "tavily_results": tavily_results
+                }
+                
+                combined_data_str = json.dumps(combined_data)
+                analysis_result = executor.submit(process_log_data, combined_data_str)
+                save_to_database(json.dumps(log_data), vt_info, analysis_result.result())
+            else:
+                logging.debug(f"Skipping non-public IP: {ip}")
 
 def process_ips():
     flagged_ips, error_ips = read_vt_results(VT_RESULT_FILE_PATH)
@@ -313,32 +350,16 @@ def process_ips():
             sleep(5)  # Add a 5-second delay between IP searches
     save_tavily_results_to_database(tavily_results)
 
-def scheduled_task():
+def daily_processing():
+    logging.info("Starting daily log processing")
+    process_logs()
     process_ips()
-
-def run_daily():
-    # Initialize the observer for the VirusTotal IP checking
-    logging.debug("Starting VirusTotal IP check observer")
-    api_key = VIRUSTOTAL_API_KEY
-    path = '.'  # Current directory
-    ip_event_handler = IPFileHandler(api_key)
-    eve_event_handler = EveFileHandler()
-    observer = Observer()
-    observer.schedule(ip_event_handler, path, recursive=False)
-    observer.schedule(eve_event_handler, path, recursive=False)
-    observer.start()
-    logging.debug("Observer started")
-    try:
-        while True:
-            sleep(1)
-    except KeyboardInterrupt:
-        observer.stop()
-    observer.join()
+    logging.info("Daily log processing completed")
 
 if __name__ == '__main__':
     initialize_database()
-    schedule.every().day.at("00:00").do(run_daily)
-    schedule.every().monday.at("00:00").do(scheduled_task)
+    schedule.every().day.at("02:00").do(daily_processing)
+    
     while True:
         schedule.run_pending()
         sleep(60)
